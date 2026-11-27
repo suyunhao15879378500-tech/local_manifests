@@ -38,14 +38,13 @@ env:
   DEVICE: ${{ inputs.device || 'chopin' }}
   VARIANT: ${{ inputs.variant || 'userdebug' }}
   MANIFEST_BRANCH: ${{ inputs.manifest_branch || 'lineage-23.2' }}
-  # 自托管 runner 建议指向大盘持久目录，跨次运行复用源码树做增量编译
   WORK_DIR: ${{ vars.WORK_DIR || format('{0}/../lineage-23.2', github.workspace) }}
   CCACHE_DIR: ${{ vars.CCACHE_DIR || '/home/runner/.ccache' }}
 
 jobs:
   build:
-    name: ${{ env.DEVICE }} · ${{ env.VARIANT }}
-    # 默认走自托管；有 Team/Enterprise 计划可设 vars.RUNNER_LABEL=ubuntu-latest-16core
+    # 修复点：job 级 name 不能用 env 上下文，改用 inputs
+    name: ${{ inputs.device || 'chopin' }} · ${{ inputs.variant || 'userdebug' }}
     runs-on: ${{ vars.RUNNER_LABEL || 'self-hosted' }}
     timeout-minutes: 360
     steps:
@@ -104,7 +103,6 @@ jobs:
           mkdir -p "${WORK_DIR}"
           cd "${WORK_DIR}"
           if [ ! -d .repo ]; then
-            # --git-lfs 必须带，webview.apk 是 LFS 对象
             repo init -u https://github.com/LineageOS/android.git \
                       -b lineage-23.2 --git-lfs
           fi
@@ -131,7 +129,6 @@ jobs:
         run: |
           set -euo pipefail
           cd "${WORK_DIR}"
-          # 脚本是幂等的，每次 sync 后都必须重跑；兼容放在源码根或 manifest 仓库里
           if [ -x ./patches/apply-patches.sh ]; then
             ./patches/apply-patches.sh
           elif [ -x "${GITHUB_WORKSPACE}/manifests/patches/apply-patches.sh" ]; then
@@ -190,3 +187,4 @@ jobs:
             ${{ env.WORK_DIR }}/out/target/product/${{ env.DEVICE }}/recovery.img
           if-no-files-found: error
           retention-days: 7
+
