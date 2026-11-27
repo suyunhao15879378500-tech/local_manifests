@@ -1,0 +1,192 @@
+name: LineageOS 23.2 · chopin/ares (test-keys)
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "目标机型"
+        type: choice
+        options: [chopin, ares]
+        default: chopin
+      variant:
+        description: "编译变体（test-keys 推荐 userdebug）"
+        type: choice
+        options: [userdebug, user]
+        default: userdebug
+      manifest_branch:
+        description: "local_manifests 分支"
+        type: string
+        default: lineage-23.2
+      clean:
+        description: "编译前清空 out/"
+        type: boolean
+        default: false
+  push:
+    branches: [lineage-23.2]
+    paths:
+      - "**.xml"
+      - "patches/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lineage-build-${{ inputs.device || 'chopin' }}
+  cancel-in-progress: false
+
+env:
+  DEVICE: ${{ inputs.device || 'chopin' }}
+  VARIANT: ${{ inputs.variant || 'userdebug' }}
+  MANIFEST_BRANCH: ${{ inputs.manifest_branch || 'lineage-23.2' }}
+  # 自托管 runner 建议指向大盘持久目录，跨次运行复用源码树做增量编译
+  WORK_DIR: ${{ vars.WORK_DIR || format('{0}/../lineage-23.2', github.workspace) }}
+  CCACHE_DIR: ${{ vars.CCACHE_DIR || '/home/runner/.ccache' }}
+
+jobs:
+  build:
+    name: ${{ env.DEVICE }} · ${{ env.VARIANT }}
+    # 默认走自托管；有 Team/Enterprise 计划可设 vars.RUNNER_LABEL=ubuntu-latest-16core
+    runs-on: ${{ vars.RUNNER_LABEL || 'self-hosted' }}
+    timeout-minutes: 360
+    steps:
+      - name: Checkout local_manifests
+        uses: actions/checkout@v4
+        with:
+          path: manifests
+          ref: ${{ env.MANIFEST_BRANCH }}
+          fetch-depth: 0
+
+      - name: Runner info
+        run: |
+          set -euo pipefail
+          uname -a
+          echo "CPU: $(nproc)"; free -h
+          df -h "${WORK_DIR}" 2>/dev/null || df -h /
+          echo "WORK_DIR=${WORK_DIR}"
+
+      - name: Install build dependencies
+        if: ${{ vars.SKIP_APT != 'true' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git git-lfs curl wget ca-certificates \
+            build-essential gperf m4 make cmake ninja-build pkg-config \
+            python3 python3-mako python3-pyyaml python3-lxml \
+            zip unzip pigz lz4 zstd liblz4-tool \
+            ccache sccache \
+            device-tree-compiler fdisk e2fsprogs libssl-dev \
+            lib32gcc-s1 lib32stdc++6 libc6-dev-i386 \
+            openjdk-17-jdk
+          sudo apt-get clean
+          git lfs install --system || true
+
+      - name: Configure git
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global protocol.version 2
+
+      - name: Download repo launcher
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/repo" https://storage.googleapis.com/git-repo-downloads/repo
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          repo --version | head -n 3
+
+      - name: Init tree & install local_manifest
+        run: |
+          set -euo pipefail
+          mkdir -p "${WORK_DIR}"
+          cd "${WORK_DIR}"
+          if [ ! -d .repo ]; then
+            # --git-lfs 必须带，webview.apk 是 LFS 对象
+            repo init -u https://github.com/LineageOS/android.git \
+                      -b lineage-23.2 --git-lfs
+          fi
+          rm -rf .repo/local_manifests
+          mkdir -p .repo/local_manifests
+          cp "${GITHUB_WORKSPACE}/manifests"/*.xml .repo/local_manifests/
+          ls -l .repo/local_manifests
+
+      - name: Sync sources (with retry)
+        run: |
+          set -euo pipefail
+          cd "${WORK_DIR}"
+          attempt=0
+          until repo sync -c -j"$(nproc)" --no-clone-bundle --fail-fast; do
+            attempt=$((attempt + 1))
+            if [ "${attempt}" -ge 5 ]; then
+              echo "repo sync 连续失败 5 次，终止"; exit 1
+            fi
+            echo "sync 失败（第 ${attempt} 次），30s 后重试..."
+            sleep 30
+          done
+
+      - name: Apply local patches
+        run: |
+          set -euo pipefail
+          cd "${WORK_DIR}"
+          # 脚本是幂等的，每次 sync 后都必须重跑；兼容放在源码根或 manifest 仓库里
+          if [ -x ./patches/apply-patches.sh ]; then
+            ./patches/apply-patches.sh
+          elif [ -x "${GITHUB_WORKSPACE}/manifests/patches/apply-patches.sh" ]; then
+            "${GITHUB_WORKSPACE}/manifests/patches/apply-patches.sh"
+          else
+            echo "未找到 patches/apply-patches.sh，跳过补丁"
+          fi
+
+      - name: Guard test-keys / variant
+        run: |
+          set -euo pipefail
+          cd "${WORK_DIR}"
+          if [ "${VARIANT}" = "user" ] && [ ! -d vendor/lineage-priv/keys ]; then
+            echo "::warning::user 变体通常需要 vendor/lineage-priv/keys，当前只有 test-keys，签名会不同"
+          fi
+          echo "签名：test-keys（未提供 lineage-priv 私钥）"
+
+      - name: Clean out (optional)
+        if: ${{ inputs.clean }}
+        run: rm -rf "${WORK_DIR}/out"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cd "${WORK_DIR}"
+          source build/envsetup.sh
+          lunch "lineage_${DEVICE}-bp4a-${VARIANT}"
+          mka -j"$(nproc)" bacon
+
+      - name: Collect info
+        id: sum
+        run: |
+          set -euo pipefail
+          OUT="${WORK_DIR}/out/target/product/${DEVICE}"
+          ls -lh "${OUT}" | head -n 40
+          ZIP=$(ls "${OUT}"/lineage-*.zip 2>/dev/null | head -n 1 || true)
+          if [ -n "${ZIP}" ]; then
+            echo "zip=$(basename "${ZIP}")" >> "$GITHUB_OUTPUT"
+            echo "size=$(du -h "${ZIP}" | cut -f1)" >> "$GITHUB_OUTPUT"
+            echo "sha256=$(sha256sum "${ZIP}" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+            {
+              echo "### 产物"
+              echo "- 文件：$(basename "${ZIP}")"
+              echo "- 大小：$(du -h "${ZIP}" | cut -f1)"
+              echo "- SHA256：\`$(sha256sum "${ZIP}" | cut -d' ' -f1)\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineage-${{ env.DEVICE }}-${{ github.run_number }}
+          path: |
+            ${{ env.WORK_DIR }}/out/target/product/${{ env.DEVICE }}/lineage-*.zip
+            ${{ env.WORK_DIR }}/out/target/product/${{ env.DEVICE }}/boot.img
+            ${{ env.WORK_DIR }}/out/target/product/${{ env.DEVICE }}/recovery.img
+          if-no-files-found: error
+          retention-days: 7
